@@ -1,0 +1,37 @@
+# Runs and artefacts
+runs/
+logs/
+agent_logs/
+*.trace.jsonl
+*.eval_summary.json
+*.log
+*.traj.json
+
+# Generated pricing staging files
+data/model_pricing.staged.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (same convention as SWERouterBench)
+.env
