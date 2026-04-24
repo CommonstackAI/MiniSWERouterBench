@@ -1,6 +1,6 @@
 # MiniSWERouterBench
 
-MiniSWERouterBench runs [SWERouterBench](https://github.com/commonrouter-lab/SWERouterBench)'s
+MiniSWERouterBench runs [SWERouterBench](https://github.com/CommonstackAI/SWERouterBench)'s
 per-step router evaluation on top of the
 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) scaffold.
 
@@ -57,7 +57,7 @@ CLI flags `--base-url` and `--api-key` override environment defaults.
 
 MiniSWERouterBench does not import your code automatically. You pass an import path
 and string kwargs, the CLI imports a callable, calls it, and expects a SWERouterBench
-[`Router`](https://github.com/commonrouter-lab/SWERouterBench/blob/main/swerouter/router.py)
+[`Router`](https://github.com/CommonstackAI/SWERouterBench/blob/main/swerouter/router.py)
 instance:
 
 - **`--router-import`**: `module:path.to.Callable` — usually a class or a
@@ -88,7 +88,7 @@ check, not as a production router (see “Production defaults vs. dev knobs” b
 
 `SWERouterBench` ships an "editor" scaffold (bash + `str_replace_editor` +
 `finish`) that is tool-rich. The ground-truth tier labels published by
-[CommonRouterBench](https://github.com/commonrouter-lab/CommonRouterBench)
+[CommonRouterBench](https://github.com/CommonstackAI/CommonRouterBench)
 were, however, harvested from trajectories produced by mini-swe-agent's
 bash-only scaffold. Reusing those labels faithfully therefore requires an
 aligned scaffold.
@@ -184,15 +184,16 @@ dev-time conveniences:
   baseline).
 - `GoldTierRouter` (imported from `swerouter.routers.gold_tier`): oracle
   router that reads
-  [CommonRouterBench](https://github.com/commonrouter-lab/CommonRouterBench)'s
+  [CommonRouterBench](https://github.com/CommonstackAI/CommonRouterBench)'s
   `target_tier` ground truth per step. Useful only for sanity-checking the
   pipeline or as a theoretical "perfect tier routing" reference — not a
   real router you'd submit to the leaderboard.
 
 ## Related projects
 
-- [CommonRouterBench](https://github.com/commonrouter-lab/CommonRouterBench) — the upstream static router benchmark and GT bank.
-- [SWERouterBench](https://github.com/commonrouter-lab/SWERouterBench) — dynamic router bench on the editor scaffold.
+- [CommonRouterBench](https://github.com/CommonstackAI/CommonRouterBench) — the upstream static router benchmark and GT bank.
+- [SWERouterBench](https://github.com/CommonstackAI/SWERouterBench) — dynamic router bench on the editor scaffold.
+- [MiniSWERouterBench](https://github.com/CommonstackAI/MiniSWERouterBench) — this repository (mini-swe-agent harness).
 - [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) — the scaffold this bench pivots on.
 
 ## License
