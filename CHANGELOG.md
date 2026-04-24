@@ -8,6 +8,25 @@ to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `miniswerouterbench audit-trace-cost`: same aggregate as `swerouterbench
+  audit-trace-cost` (sums `step_cost_usd` vs `raw_usage.cost` from
+  `run_dir/*.trace.jsonl`).
+- `miniswerouterbench run` accepts optional `--pool`, `--pricing`, `--ttl`, and
+  `--tier-map` (paths to the same JSON tables as SWERouterBench) so two-router
+  studies can pin identical pool/pricing/TTL/tier maps. `EvalRequest` /
+  `RunInstanceRequest` now thread `tier_map_path` through `run_eval`.
+- `scripts/examples/`: `env.inc.sh` (source SWERouterBench `.env`; if
+  `OPENROUTER_API_KEY_EXP` is set it overrides `OPENROUTER_API_KEY`, matching
+  `runs/*/resume.sh`), generic `resume_until_n.sh` (documents default
+  `MAX_STEPS=250` / `BUDGET_USD=3.0` for mini official / leaderboard parity),
+  and `example_router_a.sh` / `example_router_b.sh` as **SemanticRouterKNN**
+  vs **UncommonRoute** wrappers targeting 500 Verified jobs under
+  `runs/mini_sr_knn_verified500` and `runs/mini_uncommonroute_verified500`.
+- README / README.zh: CLI table, run layout, A/B workflow, and note that
+  detailed I/O lives in `*.mini_traj.json` (not `llm_io/`, which is editor-only).
+- Trace rows include upstream ``litellm_estimate`` (see SWERouterBench
+  ``swerouter/litellm_estimate.py``).
+
 - Independent repository skeleton: `pyproject.toml` (PyPI name
   `MiniSWERouterBench`, import name `miniswerouter`), Apache-2.0 `LICENSE`,
   `.gitignore`.

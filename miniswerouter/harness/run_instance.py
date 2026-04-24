@@ -22,6 +22,7 @@ the editor-scaffold agent loop for mini-swe-agent's ``DefaultAgent`` +
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -66,6 +67,166 @@ _SWEROUTER_ROOT = Path(swerouter.__file__).resolve().parent.parent
 DEFAULT_POOL = _SWEROUTER_ROOT / "data" / "model_pool.json"
 DEFAULT_PRICING = _SWEROUTER_ROOT / "data" / "model_pricing.json"
 DEFAULT_TTL = _SWEROUTER_ROOT / "data" / "ttl_policy.json"
+DEFAULT_TIER_MAP = _SWEROUTER_ROOT / "data" / "tier_to_model.json"
+
+
+def _recover_agent_metrics_from_trace(trace_path: Path) -> dict[str, Any] | None:
+    """When the agent loop raised before ``results/*.json`` was filled, read the
+    ``loop_summary`` row from ``*.trace.jsonl`` so ``total_router_cost_usd``
+    matches the trace (same contract as :mod:`swerouter.harness.run_instance`).
+    """
+
+    if not trace_path.is_file():
+        return None
+    last_summary: dict[str, Any] | None = None
+    with trace_path.open("r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("__marker__") == "loop_summary":
+                last_summary = row
+    return last_summary
+
+
+def _load_tier_reverse_map(path: Path) -> dict[str, str]:
+    """Invert ``tier_to_model.json`` to ``{model_id: tier_name}``."""
+
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    fwd = doc.get("map") if isinstance(doc, dict) else None
+    if not isinstance(fwd, dict):
+        return {}
+    rev: dict[str, str] = {}
+    for tier_name, model_id in fwd.items():
+        if isinstance(tier_name, str) and isinstance(model_id, str):
+            rev[model_id] = tier_name
+    return rev
+
+
+def _parse_trace_for_summary(trace_path: Path) -> list[dict[str, Any]]:
+    """Read ``<iid>.trace.jsonl`` and pair each step row with a following
+    ``tool_results`` marker when present (SWERouterBench shape; mini emits
+    steps only, so ``tool_results`` is usually empty).
+    """
+
+    if not trace_path.is_file():
+        return []
+    step_rows: dict[int, dict[str, Any]] = {}
+    tool_results: dict[int, list[dict[str, Any]]] = {}
+    with trace_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            marker = row.get("__marker__")
+            if marker == "tool_results":
+                idx = row.get("step_index")
+                if isinstance(idx, int):
+                    tool_results[idx] = list(row.get("tool_results") or [])
+            elif marker is None and "step_index" in row and "model_id" in row:
+                idx = row["step_index"]
+                if isinstance(idx, int):
+                    step_rows[idx] = row
+    out: list[dict[str, Any]] = []
+    for idx in sorted(step_rows.keys()):
+        row = dict(step_rows[idx])
+        row["tool_results"] = tool_results.get(idx, [])
+        out.append(row)
+    return out
+
+
+def _write_case_summary(
+    *,
+    output_dir: Path,
+    result: "InstanceResult",
+    tier_by_model: dict[str, str],
+    detail_log_path: Path,
+) -> Path:
+    """Persist ``case_summaries/<iid>.summary.json`` (same layout as SWERouterBench).
+
+    ``io_log_path`` points at the bench-specific detailed log: on the mini
+    scaffold that is ``<instance_id>.mini_traj.json`` (full mini trajectory),
+    not ``llm_io/*.io.jsonl`` which only the editor scaffold emits.
+    """
+
+    steps_raw = _parse_trace_for_summary(result.trace_path)
+    per_step: list[dict[str, Any]] = []
+    tier_dist: dict[str, int] = {}
+    for row in steps_raw:
+        model_id = row.get("model_id")
+        tier = tier_by_model.get(model_id) if isinstance(model_id, str) else None
+        if tier is not None:
+            tier_dist[tier] = tier_dist.get(tier, 0) + 1
+        per_step.append(
+            {
+                "step_index": row.get("step_index"),
+                "model_id": model_id,
+                "tier": tier,
+                "provider": row.get("provider"),
+                "rationale": row.get("rationale"),
+                "latency_ms": row.get("latency_ms"),
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "usage": row.get("usage"),
+                "step_cost_usd": row.get("step_cost_usd"),
+                "cumulative_cost_usd": row.get("cumulative_cost_usd"),
+                "cache_lookup": row.get("cache_lookup"),
+                "tool_call_count": row.get("tool_call_count"),
+                "assistant_content_len": row.get("assistant_content_len"),
+                "tool_calls_preview": row.get("tool_calls_preview"),
+                "tool_results": [
+                    {
+                        "tool_name": tr.get("tool_name"),
+                        "ok": tr.get("ok"),
+                        "content_length": tr.get("content_length"),
+                    }
+                    for tr in (row.get("tool_results") or [])
+                ],
+            }
+        )
+    summary = {
+        "instance_id": result.instance_id,
+        "resolved": result.resolved,
+        "patch_applied": result.patch_applied,
+        "step_count": result.step_count,
+        "finished_by": result.finished_by,
+        "total_router_cost_usd": result.total_router_cost_usd,
+        "agent_error": result.agent_error,
+        "eval_error": result.eval_error,
+        "eval": {
+            "fail_to_pass_pass_count": result.fail_to_pass_pass_count,
+            "fail_to_pass_fail_count": result.fail_to_pass_fail_count,
+            "pass_to_pass_pass_count": result.pass_to_pass_pass_count,
+            "pass_to_pass_fail_count": result.pass_to_pass_fail_count,
+            "eval_report_path": (
+                str(result.eval_report_path) if result.eval_report_path else None
+            ),
+        },
+        "pool_fingerprint": result.pool_fingerprint,
+        "pricing_schema_version": result.pricing_schema_version,
+        "ttl_policy_name": result.ttl_policy_name,
+        "model_distribution": dict(result.model_distribution),
+        "tier_distribution": tier_dist,
+        "trace_path": str(result.trace_path),
+        "io_log_path": str(detail_log_path),
+        "per_step": per_step,
+    }
+    path = output_dir / "case_summaries" / f"{result.instance_id}.summary.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False, indent=2)
+    return path
 
 # mini's CLI default for the eval model name sub-dir; we keep SWERouterBench's
 # value so leaderboard reports converge.
@@ -86,6 +247,7 @@ class RunInstanceRequest:
     pool_path: Path = DEFAULT_POOL
     pricing_path: Path = DEFAULT_PRICING
     ttl_path: Path = DEFAULT_TTL
+    tier_map_path: Path = DEFAULT_TIER_MAP
     # Defaults match mini-swe-agent's official SWE-bench config
     # (``minisweagent/config/benchmarks/swebench.yaml``: step_limit=250,
     # cost_limit=3). Dev harnesses that want to run tighter (to save tokens
@@ -288,7 +450,19 @@ def run_instance(request: RunInstanceRequest) -> InstanceResult:
         model_name=MINI_EVAL_MODEL_NAME,
     )
 
-    return InstanceResult(
+    if agent_error is not None:
+        recovered = _recover_agent_metrics_from_trace(trace_path)
+        if recovered is not None:
+            step_count = int(recovered.get("step_count", step_count))
+            total_router_cost_usd = float(
+                recovered.get("total_router_cost_usd", total_router_cost_usd)
+            )
+            finished_by = str(recovered.get("finished_by") or finished_by)
+            md = recovered.get("model_distribution")
+            if isinstance(md, dict):
+                model_distribution = {str(k): int(v) for k, v in md.items()}
+
+    result = InstanceResult(
         instance_id=request.instance_id,
         resolved=eval_report.resolved,
         patch=patch_text or None,
@@ -314,6 +488,19 @@ def run_instance(request: RunInstanceRequest) -> InstanceResult:
         },
     )
 
+    try:
+        tier_by_model = _load_tier_reverse_map(Path(request.tier_map_path))
+        _write_case_summary(
+            output_dir=output_dir,
+            result=result,
+            tier_by_model=tier_by_model,
+            detail_log_path=traj_path,
+        )
+    except Exception as ex:  # noqa: BLE001 — best-effort human log
+        result.extra["case_summary_error"] = f"{type(ex).__name__}: {ex}"
+
+    return result
+
 
 __all__ = [
     "RunInstanceRequest",
@@ -324,5 +511,6 @@ __all__ = [
     "DEFAULT_POOL",
     "DEFAULT_PRICING",
     "DEFAULT_TTL",
+    "DEFAULT_TIER_MAP",
     "MINI_EVAL_MODEL_NAME",
 ]

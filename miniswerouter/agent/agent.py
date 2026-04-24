@@ -37,7 +37,6 @@ from swerouter.router import (
     RunConfig,
     validate_decision,
 )
-
 from miniswerouter.agent.model import RouterAwareModel, StepRecord
 
 

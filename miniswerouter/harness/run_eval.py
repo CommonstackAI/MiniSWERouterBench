@@ -26,6 +26,7 @@ from miniswerouter.harness.run_instance import (
     DEFAULT_DATASET_SPLIT,
     DEFAULT_POOL,
     DEFAULT_PRICING,
+    DEFAULT_TIER_MAP,
     DEFAULT_TTL,
     InstanceResult,
     RunInstanceRequest,
@@ -52,9 +53,10 @@ class EvalRequest:
     pool_path: Path = DEFAULT_POOL
     pricing_path: Path = DEFAULT_PRICING
     ttl_path: Path = DEFAULT_TTL
+    tier_map_path: Path = DEFAULT_TIER_MAP
     instance_ids: tuple[str, ...] | None = None
     limit: int | None = None
-    max_workers: int = 4
+    max_workers: int = 2
     # Defaults mirror ``RunInstanceRequest``: mini's official SWE-bench
     # step_limit=250 / cost_limit=3. ``max_steps_by_instance`` is a dev-time
     # knob (e.g. capping each case at len(CRB_GT)); in production runs it
@@ -137,6 +139,8 @@ def _load_existing_result(output_dir: Path, instance_id: str) -> InstanceResult 
             blob = json.load(fh)
     except Exception:
         return None
+    # Same resume contract as :mod:`swerouter.harness.run_eval`: any valid
+    # persisted ``results/<instance_id>.json`` is never discarded on resume.
     try:
         return InstanceResult(
             instance_id=blob["instance_id"],
@@ -191,6 +195,15 @@ def run_eval(request: EvalRequest, *, router_label: str) -> EvalSummary:
         else:
             pending.append(iid)
 
+    skipped = len(instance_ids) - len(pending)
+    if skipped:
+        print(
+            f"[miniswerouterbench] run_eval: reusing {skipped} existing "
+            f"result(s) under {output_dir / 'results'}; "
+            "pass --force-rerun to re-execute and refresh costs.",
+            flush=True,
+        )
+
     def _execute_one(instance_id: str) -> InstanceResult:
         per_instance_cap = request.max_steps
         override_map = request.max_steps_by_instance or {}
@@ -212,6 +225,7 @@ def run_eval(request: EvalRequest, *, router_label: str) -> EvalSummary:
             pool_path=request.pool_path,
             pricing_path=request.pricing_path,
             ttl_path=request.ttl_path,
+            tier_map_path=request.tier_map_path,
             max_steps=per_instance_cap,
             budget_usd=request.budget_usd,
             per_command_timeout_sec=request.per_command_timeout_sec,
@@ -222,17 +236,36 @@ def run_eval(request: EvalRequest, *, router_label: str) -> EvalSummary:
         return run_instance(req)
 
     if pending:
+        n_pending = len(pending)
+        print(
+            f"[miniswerouterbench] run_eval: executing {n_pending} pending instance(s) "
+            f"(max_workers={request.max_workers})",
+            flush=True,
+        )
         with ThreadPoolExecutor(max_workers=request.max_workers) as pool_ex:
             futures = {pool_ex.submit(_execute_one, iid): iid for iid in pending}
+            done_n = 0
             for fut in as_completed(futures):
                 iid = futures[fut]
                 try:
                     result = fut.result()
                 except Exception as ex:  # noqa: BLE001 — record per-instance failure and continue
+                    done_n += 1
                     errors.append({"instance_id": iid, "error": f"{type(ex).__name__}: {ex}"})
+                    print(
+                        f"[miniswerouterbench] instance {done_n}/{n_pending} {iid}: "
+                        f"FAILED {type(ex).__name__}",
+                        flush=True,
+                    )
                     continue
                 _persist_result(output_dir, result)
                 results.append(result)
+                done_n += 1
+                print(
+                    f"[miniswerouterbench] instance {done_n}/{n_pending} {iid}: "
+                    f"ok resolved={result.resolved} cost_usd={result.total_router_cost_usd:.4f}",
+                    flush=True,
+                )
 
     finished_at = time.time()
     resolved_count = sum(1 for r in results if r.resolved)

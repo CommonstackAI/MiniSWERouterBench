@@ -3,10 +3,12 @@
 Subcommands:
 
 * ``run``     -- run a router on SWE-bench Verified via mini-swe-agent.
-* ``score``   -- score an existing run directory using SWERouterBench's
-                 scorer (same ``total_actual_bill_usd`` metric).
-* ``render``  -- render a markdown leaderboard from one or more score files
-                 using SWERouterBench's renderer.
+* ``score``       -- score an existing run directory using SWERouterBench's
+                     scorer (same ``total_actual_bill_usd`` metric and flags).
+* ``audit-infra`` -- scan ``results/*.json`` for fair-metrics infra exclusions.
+* ``audit-trace-cost`` -- sum ``step_cost_usd`` vs ``raw_usage.cost`` from ``*.trace.jsonl``.
+* ``render``      -- render a markdown leaderboard from one or more score files
+                     using SWERouterBench's renderer.
 
 Example::
 
@@ -20,6 +22,14 @@ Example::
         --output-dir runs/mini_gt_one \\
         --instances django__django-11133 \\
         --max-steps 250 --budget-usd 3 --run-id mini_gt_one --force-rerun
+
+Optional locked-table overrides (pin the same files across two routers)::
+
+    miniswerouterbench run ... \\
+        --pool /path/to/model_pool.json \\
+        --pricing /path/to/model_pricing.json \\
+        --ttl /path/to/ttl_policy.json \\
+        --tier-map /path/to/tier_to_model.json
 """
 
 from __future__ import annotations
@@ -31,7 +41,87 @@ import os
 import sys
 from pathlib import Path
 
+# Monorepo checkout: ``swerouter.cache`` imports ``main.tokenizer`` from the
+# inner ``CommonRouterBench/`` package. Insert it before any ``swerouter`` import.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_CRB_SRC = _REPO_ROOT / "CommonRouterBench"
+if _CRB_SRC.is_dir():
+    crb_s = str(_CRB_SRC)
+    if crb_s not in sys.path:
+        sys.path.insert(0, crb_s)
+
 from swerouter.router import Router
+
+
+def _mini_repo_root() -> Path:
+    """``MiniSWERouterBench/`` directory (parent of the ``miniswerouter`` package)."""
+
+    return Path(__file__).resolve().parent.parent
+
+
+def _load_mini_dotenv() -> None:
+    """Populate ``os.environ`` from ``MiniSWERouterBench/.env`` when keys are unset.
+
+    Does not add a ``python-dotenv`` dependency: minimal KEY=value parsing only.
+    Existing non-empty environment variables win (same idea as ``dotenv``).
+    """
+
+    path = _mini_repo_root() / ".env"
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if not key:
+            continue
+        cur = os.environ.get(key)
+        if cur is None or cur == "":
+            os.environ[key] = val
+
+
+def _apply_gateway_aliases() -> None:
+    """Map CommonStack-style names to the OPENROUTER_* keys LiteLLM / CLI expect.
+
+    When ``COMMONSTACK_API_BASE`` / ``COMMONSTACK_API_KEY`` are set, they take
+    precedence over ``OPENROUTER_*`` / ``SWEROUTER_*`` so a single CommonStack
+    block in ``MiniSWERouterBench/.env`` is enough. Legacy OpenRouter keys may
+    remain for other tools, but **must not shadow** chat traffic: the run
+    subcommand defaults to ``SWEROUTER_API_KEY`` or ``OPENROUTER_API_KEY``, so
+    those are overwritten when CommonStack credentials are present.
+    """
+
+    base = (os.environ.get("COMMONSTACK_API_BASE") or "").strip()
+    if base:
+        os.environ["OPENROUTER_BASE_URL"] = base
+        os.environ["SWEROUTER_BASE_URL"] = base
+    ck = (os.environ.get("COMMONSTACK_API_KEY") or "").strip()
+    if ck:
+        os.environ["OPENROUTER_API_KEY_EXP"] = ck
+        os.environ["OPENROUTER_API_KEY"] = ck
+        os.environ["SWEROUTER_API_KEY"] = ck
+    if not (os.environ.get("OPENROUTER_API_KEY") or "").strip():
+        exp = (os.environ.get("OPENROUTER_API_KEY_EXP") or "").strip()
+        if exp:
+            os.environ["OPENROUTER_API_KEY"] = exp
+
+
+def _bootstrap_mini_env() -> None:
+    _load_mini_dotenv()
+    _apply_gateway_aliases()
 
 
 def _parse_router_args(pairs: list[str]) -> dict[str, str]:
@@ -113,6 +203,12 @@ def _parse_max_steps_by_instance(
 
 def _cmd_run(args: argparse.Namespace) -> int:
     from miniswerouter.harness.run_eval import EvalRequest, run_eval
+    from miniswerouter.harness.run_instance import (
+        DEFAULT_POOL,
+        DEFAULT_PRICING,
+        DEFAULT_TIER_MAP,
+        DEFAULT_TTL,
+    )
 
     router = _instantiate_router(args.router_import, _parse_router_args(args.router_arg))
 
@@ -139,6 +235,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         force_rerun=args.force_rerun,
         rm_image=args.rm_image,
+        pool_path=Path(args.pool) if args.pool else DEFAULT_POOL,
+        pricing_path=Path(args.pricing) if args.pricing else DEFAULT_PRICING,
+        ttl_path=Path(args.ttl) if args.ttl else DEFAULT_TTL,
+        tier_map_path=Path(args.tier_map) if args.tier_map else DEFAULT_TIER_MAP,
     )
     summary = run_eval(req, router_label=args.router_label)
     print(
@@ -169,25 +269,100 @@ def _cmd_score(args: argparse.Namespace) -> int:
         pricing_path=Path(args.pricing) if args.pricing else None,
         ttl_path=Path(args.ttl) if args.ttl else None,
         pool_path=Path(args.pool) if args.pool else None,
+        exclude_infra_failures=bool(args.exclude_infra_failures),
+        reprice_from_raw_usage=bool(args.reprice_from_raw_usage),
     )
     out_path = Path(args.out) if args.out else Path(args.run_dir) / "score.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(score, fh, indent=2)
-    print(
-        json.dumps(
-            {
-                "router_label": score["router_label"],
-                "total_actual_bill_usd": score["total_actual_bill_usd"],
-                "resolved_count": score["resolved_count"],
-                "resolved_rate": score["resolved_rate"],
-                "instances": len(score["per_instance"]),
-                "pricing_fingerprint": score["pricing_fingerprint"],
-                "score_path": str(out_path),
-            },
-            indent=2,
-        )
+    summary = {
+        "router_label": score["router_label"],
+        "total_actual_bill_usd": score["total_actual_bill_usd"],
+        "resolved_count": score["resolved_count"],
+        "resolved_rate": score["resolved_rate"],
+        "instances": score["instance_count"],
+        "pricing_fingerprint": score["pricing_fingerprint"],
+        "score_path": str(out_path),
+    }
+    if score.get("exclude_infra_failures"):
+        summary["raw_instance_count"] = score["raw_instance_count"]
+        summary["infra_excluded_count"] = score["infra_excluded_count"]
+    if score.get("reprice_from_raw_usage"):
+        summary["reprice_from_raw_usage"] = True
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+def _cmd_audit_infra(args: argparse.Namespace) -> int:
+    """Summarise which instances ``--exclude-infra-failures`` would drop."""
+
+    from swerouter.infra_errors import (
+        is_excluded_from_fair_metrics,
+        is_transport_or_infra_failure,
     )
+
+    run_dir = Path(args.run_dir).resolve()
+    results_dir = run_dir / "results"
+    if not results_dir.is_dir():
+        raise SystemExit(f"no results directory: {results_dir}")
+
+    total = 0
+    fair_excluded = 0
+    subset_transport = 0
+    excluded_ids: list[str] = []
+
+    for p in sorted(results_dir.glob("*.json")):
+        total += 1
+        with p.open("r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        iid = str(doc.get("instance_id") or p.stem)
+        ae = doc.get("agent_error")
+        ee = doc.get("eval_error")
+        ae_s = ae if isinstance(ae, str) else None
+        ee_s = ee if isinstance(ee, str) else None
+        if not is_excluded_from_fair_metrics(ae_s, ee_s):
+            continue
+        fair_excluded += 1
+        excluded_ids.append(iid)
+        if is_transport_or_infra_failure(ae_s) or is_transport_or_infra_failure(ee_s):
+            subset_transport += 1
+
+    report = {
+        "run_dir": str(run_dir),
+        "results_json_count": total,
+        "fair_metrics_excluded_count": fair_excluded,
+        "fair_metrics_excluded_transport_or_quota_subset": subset_transport,
+        "fair_metrics_excluded_env_harness_provider_subset": fair_excluded
+        - subset_transport,
+        "eligible_for_fair_headline_count": total - fair_excluded,
+    }
+    if args.list_ids:
+        report["excluded_instance_ids"] = sorted(excluded_ids)
+
+    out_path = Path(args.out) if args.out else None
+    text = json.dumps(report, indent=2)
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        print(f"wrote {out_path}")
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_audit_trace_cost(args: argparse.Namespace) -> int:
+    from swerouter.trace_cost_audit import audit_trace_cost_metrics
+
+    report = audit_trace_cost_metrics(Path(args.run_dir))
+    text = json.dumps(report, indent=2)
+    out_path = Path(args.out) if args.out else None
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+        print(f"wrote {out_path}")
+    else:
+        print(text)
     return 0
 
 
@@ -234,7 +409,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-dir", required=True)
     run.add_argument("--limit", type=int, default=None)
     run.add_argument("--instances", nargs="*", default=None)
-    run.add_argument("--workers", type=int, default=4)
+    run.add_argument("--workers", type=int, default=2)
     run.add_argument(
         "--max-steps", type=int, default=250,
         help="step_limit passed to mini's DefaultAgent. Default matches mini's "
@@ -266,6 +441,28 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--run-id", default="miniswerouter_default")
     run.add_argument("--force-rerun", action="store_true")
     run.add_argument("--rm-image", action="store_true")
+    run.add_argument(
+        "--pool",
+        default=None,
+        help="Override path to model_pool.json (default: SWERouterBench data/model_pool.json).",
+    )
+    run.add_argument(
+        "--pricing",
+        default=None,
+        help="Override path to model_pricing.json (default: SWERouterBench data/model_pricing.json).",
+    )
+    run.add_argument(
+        "--ttl",
+        default=None,
+        help="Override path to ttl_policy.json (default: SWERouterBench data/ttl_policy.json).",
+    )
+    run.add_argument(
+        "--tier-map",
+        default=None,
+        dest="tier_map",
+        help="Override path to tier_to_model.json for case_summaries tier labels "
+        "(default: SWERouterBench data/tier_to_model.json).",
+    )
     run.set_defaults(func=_cmd_run)
 
     score = sub.add_parser("score", help="Score an existing run directory.")
@@ -275,7 +472,48 @@ def _build_parser() -> argparse.ArgumentParser:
     score.add_argument("--ttl", default=None)
     score.add_argument("--pool", default=None)
     score.add_argument("--out", default=None)
+    score.add_argument(
+        "--exclude-infra-failures",
+        action="store_true",
+        help="Exclude instances matching swerouter.infra_errors.is_excluded_from_fair_metrics "
+        "(transport/quota + env/harness/provider-wrap) from headline metrics.",
+    )
+    score.add_argument(
+        "--reprice-from-raw-usage",
+        action="store_true",
+        help="Recompute per-step USD and baseline inputs from trace raw_usage "
+        "using current normalize_usage + pricing (historical trace correction).",
+    )
     score.set_defaults(func=_cmd_score)
+
+    audit = sub.add_parser(
+        "audit-infra",
+        help="Scan results/*.json for instances excluded by --exclude-infra-failures.",
+    )
+    audit.add_argument("--run-dir", required=True)
+    audit.add_argument(
+        "--list-ids",
+        action="store_true",
+        help="Include sorted excluded_instance_ids in the JSON output.",
+    )
+    audit.add_argument(
+        "--out",
+        default=None,
+        help="Write JSON report to this path instead of stdout.",
+    )
+    audit.set_defaults(func=_cmd_audit_infra)
+
+    audit_cost = sub.add_parser(
+        "audit-trace-cost",
+        help="Sum step_cost_usd and raw_usage.cost from run_dir/*.trace.jsonl (OpenRouter vs table).",
+    )
+    audit_cost.add_argument("--run-dir", required=True)
+    audit_cost.add_argument(
+        "--out",
+        default=None,
+        help="Write JSON report to this path instead of stdout.",
+    )
+    audit_cost.set_defaults(func=_cmd_audit_trace_cost)
 
     render = sub.add_parser("render", help="Render a markdown leaderboard.")
     render.add_argument("--score", nargs="+", required=True)
@@ -286,6 +524,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _bootstrap_mini_env()
     parser = _build_parser()
     args = parser.parse_args(argv)
 

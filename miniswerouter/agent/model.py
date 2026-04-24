@@ -31,6 +31,8 @@ step -- all pool members share the same mini BASH_TOOL schema.
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -129,9 +131,63 @@ class RouterAwareModel:
 
         self._step_log: list[StepRecord] = []
 
+    @property
+    def pricing_table(self) -> PricingTable:
+        """Locked :class:`PricingTable` (for trace-side audit helpers)."""
+
+        return self._pricing
+
     # ------------------------------------------------------------------
     # sub-model construction
     # ------------------------------------------------------------------
+
+    def _openai_compat_litellm_model_id(self, pool_model_id: str) -> str:
+        """Optional remap of pool ``model_id`` for OpenAI-compat gateways.
+
+        Some proxies expect different vendor strings than OpenRouter's catalogue
+        (e.g. hyphen vs dot in Claude IDs). Set::
+
+            MINI_OPENAI_COMPAT_MODEL_ID_ALIASES_JSON='{"pool-id":"gateway-id"}'
+
+        (single-line JSON object). Unmapped IDs pass through unchanged.
+        """
+
+        raw = (os.environ.get("MINI_OPENAI_COMPAT_MODEL_ID_ALIASES_JSON") or "").strip()
+        if not raw:
+            return pool_model_id
+        try:
+            aliases = json.loads(raw)
+        except json.JSONDecodeError:
+            return pool_model_id
+        if not isinstance(aliases, dict):
+            return pool_model_id
+        out = aliases.get(pool_model_id)
+        return str(out) if isinstance(out, str) and out else pool_model_id
+
+    def _litellm_model_name(self, entry: ModelPoolEntry) -> str:
+        """Pick the LiteLLM ``model=`` prefix for ``model_kwargs.api_base``.
+
+        ``openrouter/...`` keeps OpenRouter-specific client behaviour (headers,
+        transforms). For OpenAI-compatible gateways (CommonStack, local vLLM,
+        etc.) use ``openai/...`` so LiteLLM sends a plain ``/v1/chat/completions``
+        POST with ``Authorization: Bearer <api_key>`` and ``model`` equal to
+        the pool ``model_id`` string after the prefix.
+
+        Override: ``SWEROUTER_LITELLM_PROVIDER_PREFIX=openai`` or ``openrouter``.
+        """
+
+        mid = self._openai_compat_litellm_model_id(entry.model_id)
+        if mid.startswith("openrouter/") or mid.startswith("openai/"):
+            return mid
+        override = (os.environ.get("SWEROUTER_LITELLM_PROVIDER_PREFIX") or "").strip().lower()
+        if override == "openai":
+            return f"openai/{mid}"
+        if override == "openrouter":
+            return f"openrouter/{mid}"
+        base = (self._base_url or "").lower()
+        if "openrouter.ai" in base:
+            return f"openrouter/{mid}"
+        return f"openai/{mid}"
 
     def _build_submodel(self, entry: ModelPoolEntry) -> LitellmModel:
         """Construct one ``LitellmModel`` per pool member.
@@ -145,9 +201,7 @@ class RouterAwareModel:
         """
 
         cfg_kwargs: dict[str, Any] = {
-            "model_name": f"openrouter/{entry.model_id}"
-            if not entry.model_id.startswith("openrouter/")
-            else entry.model_id,
+            "model_name": self._litellm_model_name(entry),
             "model_kwargs": {
                 "api_base": self._base_url,
                 "api_key": self._api_key,
